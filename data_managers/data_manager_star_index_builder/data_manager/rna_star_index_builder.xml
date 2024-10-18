@@ -1,15 +1,21 @@
-<tool id="rna_star_index_builder_data_manager" name="rnastar index versioned" tool_type="manage_data" version="@IDX_VERSION@+galaxy@IDX_VERSION_SUFFIX@" profile="19.05">
+<tool id="rna_star_index_builder_data_manager" name="rnastar index versioned" tool_type="manage_data" version="@IDX_VERSION@+galaxy@IDX_VERSION_SUFFIX@" profile="23.0">
     <description>builder</description>
 
     <macros>
         <import>macros.xml</import>
     </macros>
 
-    <expand macro="requirements">
-        <requirement type="package" version="3.7">python</requirement>
-    </expand>
+    <expand macro="requirements"/>
 
     <command><![CDATA[
+#set $set_genome_sa_index_nbases = $advanced_options.advanced_options_selector == "default" or $advanced_options.genomeSAindexNbases or not $advanced_options.no_auto_sa_index_nbases
+#set $set_genome_chr_bin_nbits = $advanced_options.advanced_options_selector == "default" or $advanced_options.genomeChrBinNbits or not $advanced_options.no_auto_chr_bin_nbits
+function log2() {
+    local n=\$1; local log2=0;
+    while [[ \$n -gt 1 ]]; do n=\$((n >> 1)); log2=\$((log2 + 1)); done;
+    [[ \$log2 -gt 0 ]] && echo \$log2 || echo 1;
+} ;
+
 if [ -z "\$GALAXY_MEMORY_MB" ] ; then
     GALAXY_MEMORY_BYTES=31000000000 ;
 else
@@ -22,6 +28,27 @@ fi ;
 
 mkdir '${target_directory}' &&
 
+#if $set_genome_sa_index_nbases or $set_genome_chr_bin_nbits:
+nbases="\$(grep -v '^>' '${all_fasta_source.fields.path}' | tr -d '\n' | wc -c)" &&
+echo "Bases in reference: \$nbases" &&
+#end if
+
+#if $advanced_options.advanced_options_selector == "advanced" and $advanced_options.genomeSAindexNbases:
+saindex_nbases=${advanced_options.genomeSAindexNbases} &&
+#else if not ($advanced_options.advanced_options_selector == "advanced" and $advanced_options.no_auto_sa_index_nbases):
+saindex_nbases=\$((\$(log2 \$nbases) / 2 - 1)) &&
+[[ \$saindex_nbases -lt 14 ]] || saindex_nbases=14 &&
+#end if
+
+#if $advanced_options.advanced_options_selector == "advanced" and $advanced_options.genomeChrBinNbits:
+chr_bin_nbits=${advanced_options.genomeChrBinNbits} &&
+#else if not ($advanced_options.advanced_options_selector == "advanced" and $advanced_options.no_auto_chr_bin_nbits):
+nseqs="\$(grep -c '>' '${all_fasta_source.fields.path}')" &&
+echo "Sequences in reference: \$nseqs" &&
+chr_bin_nbits=\$((\$(log2 \$nbases) / \$(log2 \$nseqs))) &&
+[[ \$chr_bin_nbits -lt 18 ]] || chr_bin_nbits=18 &&
+#end if
+
 STAR
 --runMode genomeGenerate
 --genomeFastaFiles '${all_fasta_source.fields.path}'
@@ -31,29 +58,41 @@ STAR
     --sjdbGTFfile '${GTFconditional.sjdbGTFfile}'
     --sjdbOverhang ${GTFconditional.sjdbOverhang}
 #end if
-#if $advanced_options.advanced_options_selector == "advanced":
-    --genomeSAindexNbases ${advanced_options.genomeSAindexNbases}
-    --genomeChrBinNbits ${advanced_options.genomeChrBinNbits}
+#if $set_genome_sa_index_nbases:
+    --genomeSAindexNbases "\$saindex_nbases"
+#end if
+#if $set_genome_chr_bin_nbits:
+    --genomeChrBinNbits "\$chr_bin_nbits"
+#end if
+#if $advanced_options.advanced_options_selector == "advanced" and $advanced_options.genomeSAsparseD:
     --genomeSAsparseD ${advanced_options.genomeSAsparseD}
 #end if
 --runThreadN \${GALAXY_SLOTS:-2} &&
 
-python '${__tool_directory__}/rna_star_index_builder.py'
---config-file '${out_file}'
---value '${all_fasta_source.fields.value}'
---dbkey '${all_fasta_source.fields.dbkey}'
---index-version '@IDX_VERSION@'
-#if $name:
-    --name '$name'
-#else
-    --name '${all_fasta_source.fields.name}'
-#end if
-#if str($GTFconditional.GTFselect) == "withGTF":
-    --with-gene-model
-#end if
---data-table @IDX_DATA_TABLE@
---subdir '${subdir}'
+cp '$dmjson' '$out_file'
     ]]></command>
+    <configfiles>
+        <configfile name="dmjson"><![CDATA[#slurp
+#set $fasta_file_name = str($all_fasta_source.fields.path).split('/')[-1]
+#set $name = $name or $all_fasta_source.fields.name
+#set $target_directory = str($out_file.extra_files_path)
+#set $with_gene_model = 1 if str($GTFconditional.GTFselect) == "withGTF" else 0
+{
+  "data_tables":{
+    "@IDX_DATA_TABLE@":[
+      {
+        "value": "${all_fasta_source.fields.value}",
+        "dbkey": "${all_fasta_source.fields.dbkey}",
+        "name": "${name}",
+        "path": "SA",
+        "with_gene_model": "${with_gene_model}",
+        "version": "@IDX_VERSION@"
+      }
+    ]
+  }
+}
+]]></configfile>
+    </configfiles>
     <inputs>
         <param name="all_fasta_source" type="select" label="Source FASTA Sequence">
             <options from_data_table="all_fasta"/>
@@ -78,19 +117,28 @@ python '${__tool_directory__}/rna_star_index_builder.py'
             </param>
             <when value="default" />
             <when value="advanced">
-                <param argument="--genomeSAindexNbases" type="integer" min="1" value="14"
+                <param argument="--genomeSAindexNbases" type="integer" min="1" optional="true"
                     label="Length (bases) of the SA pre-indexing string"
                     help="Typically between 10 and 15. Longer strings will use much more memory, but allow
                         faster searches. For small genomes, the parameter –genomeSAindexNbases must be scaled
                         down to min(14, log2(GenomeLength)/2 - 1). For example, for 1 megaBase genome, this is
-                        equal to 9, for 100 kiloBase genome, this is equal to 7."/>
-                <param argument="--genomeChrBinNbits" type="integer" min="1" value="18"
+                        equal to 9, for 100 kiloBase genome, this is equal to 7. Automatically calculated if unset."/>
+                <param name="no_auto_sa_index_nbases" type="boolean" default="False"
+                    label="Do not automatically calculate --genomeSAindexNbases if it is unset"
+                    help="The --genomeSAindexNbases option will not be passed to STAR at all if this option is selected
+                        and you have not specified a value above."/>
+                <param argument="--genomeChrBinNbits" type="integer" min="1" optional="true"
                     label="Log2(chrBin), where chrBin is the size of the bins for genome storage"
                     help="Each chromosome will occupy an integer number of bins. For a genome with large number
                         of contigs, it is recommended to scale this parameter as min(18,
                         log2[max(GenomeLength/NumberOfReferences,ReadLength)]). For example, for 3 gigaBase
                         genome with 100,000 chromosomes/scaffolds, this is equal to 15."/>
-                <param argument="--genomeSAsparseD" type="integer" min="1" value="1" label="Suffix array sparsity"
+                <param name="no_auto_chr_bin_nbits" type="boolean" default="False"
+                    label="Do not automatically calculate --genomeChrBinNbits if it is unset"
+                    help="The --genomeChrBinNbits option will not be passed to STAR at all if this option is selected
+                        and you have not specified a value above."/>
+                <param argument="--genomeSAsparseD" type="integer" min="1" optional="True"
+                    label="Suffix array sparsity"
                     help="The distance between indices: use bigger numbers to decrease needed RAM at the cost of
                         mapping speed reduction"/>
             </when>
